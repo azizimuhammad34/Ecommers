@@ -4,15 +4,38 @@ const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const path = require('path');
 const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 // ---- Auth Setup ----
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'PeakNuts2026!';
+// Admin credentials must be supplied through environment variables. There are
+// deliberately no hardcoded fallbacks so a missing configuration fails closed.
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 var activeTokens = {};
 
 function generateToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+// ---- Helpers ----
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function isValidEmail(value) {
+  return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function cleanStr(value, max) {
+  if (typeof value !== 'string') return '';
+  var v = value.trim();
+  return v.length > max ? v.slice(0, max) : v;
 }
 
 // ---- Password Hashing ----
@@ -107,7 +130,7 @@ function sendOrderConfirmationEmail(toEmail, order) {
     var item = order.items[i];
     var lineTotal = item.qty * item.price;
     total += lineTotal;
-    itemsHtml += '<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:14px">' + item.name + '</td>' +
+    itemsHtml += '<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:14px">' + escapeHtml(item.name) + '</td>' +
       '<td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:14px;text-align:center">' + item.qty + '</td>' +
       '<td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:14px;text-align:right">Rs.' + lineTotal.toFixed(2) + '</td></tr>';
   }
@@ -118,12 +141,12 @@ function sendOrderConfirmationEmail(toEmail, order) {
     subject: 'Order Confirmed - ' + order.orderId + ' | Peak Nuts',
     html: '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:30px;background:#f9f8f5;border-radius:8px">' +
       '<h1 style="font-family:Georgia,serif;color:#1a1a1a;font-size:28px;margin-bottom:10px">Order Confirmed!</h1>' +
-      '<p style="color:#5d5b5b;font-size:15px;line-height:1.8">Thank you, <strong>' + order.customer + '</strong>! Your order has been placed successfully.</p>' +
+      '<p style="color:#5d5b5b;font-size:15px;line-height:1.8">Thank you, <strong>' + escapeHtml(order.customer) + '</strong>! Your order has been placed successfully.</p>' +
       '<div style="background:#fff;padding:20px;border-radius:6px;margin:20px 0">' +
         '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Order ID:</strong> ' + order.orderId + '</p>' +
         '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Payment:</strong> Cash on Delivery</p>' +
-        '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Phone:</strong> ' + order.phone + '</p>' +
-        '<p style="margin:0;font-size:14px;color:#5d5b5b"><strong>Delivery:</strong> ' + order.address + ', ' + order.city + '</p>' +
+        '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Phone:</strong> ' + escapeHtml(order.phone) + '</p>' +
+        '<p style="margin:0;font-size:14px;color:#5d5b5b"><strong>Delivery:</strong> ' + escapeHtml(order.address) + ', ' + escapeHtml(order.city) + '</p>' +
       '</div>' +
       '<table style="width:100%;border-collapse:collapse;margin:20px 0">' +
         '<thead><tr style="background:#1a1a1a;color:#fff">' +
@@ -214,7 +237,7 @@ function sendOrderStatusEmail(toEmail, order, newStatus) {
       '<div style="background:#fff;padding:20px;border-radius:6px;margin:20px 0">' +
         '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Order ID:</strong> ' + order.orderId + '</p>' +
         '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Status:</strong> ' + newStatus + '</p>' +
-        '<p style="margin:0;font-size:14px;color:#5d5b5b"><strong>Delivery:</strong> ' + (order.address || '') + ', ' + (order.city || '') + '</p>' +
+        '<p style="margin:0;font-size:14px;color:#5d5b5b"><strong>Delivery:</strong> ' + escapeHtml(order.address || '') + ', ' + escapeHtml(order.city || '') + '</p>' +
       '</div>' +
       '<p style="color:#5d5b5b;font-size:15px;line-height:1.8">Thank you for shopping with Peak Nuts!</p>' +
       '<p style="color:#8B9A46;font-weight:600;font-size:16px;margin-top:20px">&mdash; The Peak Nuts Team</p>' +
@@ -255,6 +278,29 @@ function sendWelcomeEmail(toEmail) {
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+
+// ---- Rate Limiting ----
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts, please try again after 15 minutes' }
+});
+
+const publicWriteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' }
+});
+
+app.use('/api/login', authLimiter);
+app.use('/api/register', authLimiter);
+app.use('/api/user/login', authLimiter);
+app.use('/api/forgot-password', authLimiter);
+app.use('/api/resend-verification', authLimiter);
 
 // ---- SQLite Setup ----
 const db = new Database(path.join(__dirname, 'peaknuts.db'));
@@ -433,6 +479,9 @@ app.post('/api/login', (req, res) => {
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required' });
     }
+    if (!ADMIN_USERNAME || !ADMIN_PASSWORD) {
+      return res.status(500).json({ error: 'Admin credentials are not configured on the server' });
+    }
     if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
@@ -570,7 +619,7 @@ app.delete('/api/products/:id', requireAuth, (req, res) => {
 });
 
 // ---- Orders API ----
-app.get('/api/orders', (req, res) => {
+app.get('/api/orders', requireAuth, (req, res) => {
   try {
     const rows = db.prepare('SELECT * FROM orders ORDER BY date DESC').all();
     // Attach items to each order
@@ -589,11 +638,42 @@ app.get('/api/orders', (req, res) => {
   }
 });
 
-app.post('/api/orders', (req, res) => {
+app.post('/api/orders', publicWriteLimiter, (req, res) => {
   try {
-    const { customer, email, phone, city, address, items } = req.body;
-    if (!customer || !email || !phone || !city || !address || !items || !items.length) {
+    const customer = cleanStr(req.body.customer, 120);
+    const email = cleanStr(req.body.email, 200).toLowerCase();
+    const phone = cleanStr(req.body.phone, 40);
+    const city = cleanStr(req.body.city, 80);
+    const address = cleanStr(req.body.address, 300);
+    const rawItems = req.body.items;
+
+    if (!customer || !email || !phone || !city || !address) {
       return res.status(400).json({ error: 'All fields are required' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'A valid email address is required' });
+    }
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+      return res.status(400).json({ error: 'Your order must contain at least one item' });
+    }
+    if (rawItems.length > 50) {
+      return res.status(400).json({ error: 'Too many items in the order' });
+    }
+
+    // Never trust client-supplied prices: resolve every item against the catalog.
+    const getProductPrice = db.prepare('SELECT price FROM products WHERE name=?');
+    const sanitizedItems = [];
+    for (let i = 0; i < rawItems.length; i++) {
+      const item = rawItems[i] || {};
+      const itemName = cleanStr(item.name, 200);
+      const product = itemName ? getProductPrice.get(itemName) : null;
+      if (!itemName || !product) {
+        return res.status(400).json({ error: 'Unknown product: ' + (itemName || '(missing name)') });
+      }
+      let qty = parseInt(item.qty, 10);
+      if (!Number.isFinite(qty) || qty < 1) qty = 1;
+      if (qty > 100) qty = 100;
+      sanitizedItems.push({ name: itemName, qty: qty, price: product.price });
     }
 
     // Generate orderId: find max existing PN-XXXX and increment
@@ -611,11 +691,11 @@ app.post('/api/orders', (req, res) => {
     const oid = result.lastInsertRowid;
 
     const insertItem = db.prepare('INSERT INTO order_items (order_id, name, qty, price) VALUES (?, ?, ?, ?)');
-    for (const item of items) {
+    for (const item of sanitizedItems) {
       insertItem.run(oid, item.name, item.qty, item.price);
     }
 
-    const order = { orderId, customer, email, phone, city, address, status, date, items };
+    const order = { orderId, customer, email, phone, city, address, status, date, items: sanitizedItems };
     sendOrderConfirmationEmail(email, order);
 
     res.status(201).json(order);
@@ -626,7 +706,11 @@ app.post('/api/orders', (req, res) => {
 
 app.put('/api/orders/:id', requireAuth, (req, res) => {
   try {
-    const { status } = req.body;
+    const allowedStatuses = ['Pending', 'Shipped', 'Delivered'];
+    const status = req.body.status;
+    if (allowedStatuses.indexOf(status) === -1) {
+      return res.status(400).json({ error: 'Invalid order status' });
+    }
     const order = db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
     db.prepare('UPDATE orders SET status=? WHERE id=?').run(status, req.params.id);
@@ -660,10 +744,10 @@ app.delete('/api/subscribers/:id', requireAuth, (req, res) => {
   }
 });
 
-app.post('/api/subscribers', (req, res) => {
+app.post('/api/subscribers', publicWriteLimiter, (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email is required' });
+    const email = cleanStr(req.body.email, 200).toLowerCase();
+    if (!email || !isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required' });
     const existing = db.prepare('SELECT * FROM subscribers WHERE email = ?').get(email);
     if (existing) return res.status(409).json({ error: 'Already subscribed' });
     const date = new Date().toISOString().slice(0, 10);
@@ -692,13 +776,18 @@ app.post('/api/register', (req, res) => {
   try {
     cleanExpiredUserTokens();
     var { name, email, password } = req.body;
+    name = cleanStr(name, 120);
+    email = cleanStr(email, 200).toLowerCase();
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required' });
     }
-    if (password.length < 6) {
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'A valid email address is required' });
+    }
+    if (typeof password !== 'string' || password.length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
-    var emailLower = email.toLowerCase();
+    var emailLower = email;
     var existing = db.prepare('SELECT id FROM users WHERE email=?').get(emailLower);
     if (existing) {
       return res.status(409).json({ error: 'An account with this email already exists' });
@@ -728,10 +817,11 @@ app.post('/api/user/login', (req, res) => {
   try {
     cleanExpiredUserTokens();
     var { email, password } = req.body;
+    email = cleanStr(email, 200).toLowerCase();
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
-    var user = db.prepare('SELECT * FROM users WHERE email=?').get(email.toLowerCase());
+    var user = db.prepare('SELECT * FROM users WHERE email=?').get(email);
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -803,8 +893,9 @@ app.get('/api/user/orders', requireUser, (req, res) => {
 app.post('/api/forgot-password', (req, res) => {
   try {
     var { email } = req.body;
+    email = cleanStr(email, 200).toLowerCase();
     if (!email) return res.status(400).json({ error: 'Email is required' });
-    var user = db.prepare('SELECT id, email FROM users WHERE email=?').get(email.toLowerCase());
+    var user = db.prepare('SELECT id, email FROM users WHERE email=?').get(email);
     // Always return success to prevent email enumeration
     if (!user) return res.json({ message: 'If an account exists, a reset link has been sent.' });
     // Delete old reset tokens for this user
@@ -937,16 +1028,17 @@ app.get('/api/reviews/:productId', (req, res) => {
   }
 });
 
-app.post('/api/reviews/:productId', requireUser, (req, res) => {
+app.post('/api/reviews/:productId', publicWriteLimiter, requireUser, (req, res) => {
   try {
-    var { rating, comment } = req.body;
-    if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+    var rating = parseInt(req.body.rating, 10);
+    var comment = cleanStr(req.body.comment, 1000);
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be between 1 and 5' });
     var existing = db.prepare('SELECT id FROM reviews WHERE userId=? AND productId=?').get(req.user.id, req.params.productId);
     if (existing) {
-      db.prepare('UPDATE reviews SET rating=?, comment=?, createdAt=datetime("now") WHERE id=?').run(rating, comment || '', existing.id);
+      db.prepare('UPDATE reviews SET rating=?, comment=?, createdAt=datetime("now") WHERE id=?').run(rating, comment, existing.id);
       res.json({ message: 'Review updated' });
     } else {
-      db.prepare('INSERT INTO reviews (productId, userId, rating, comment) VALUES (?, ?, ?, ?)').run(req.params.productId, req.user.id, rating, comment || '');
+      db.prepare('INSERT INTO reviews (productId, userId, rating, comment) VALUES (?, ?, ?, ?)').run(req.params.productId, req.user.id, rating, comment);
       res.status(201).json({ message: 'Review added' });
     }
   } catch (err) {
@@ -1037,6 +1129,16 @@ app.get('/api/admin/analytics', requireAuth, (req, res) => {
 });
 
 // ---- Static files ----
+// Block direct access to server source, database, and configuration files.
+app.use(function (req, res, next) {
+  var p = (req.path || '').toLowerCase();
+  if (p === '/server.js' || p === '/package.json' || p === '/package-lock.json' ||
+      p === '/vercel.json' || p === '/.env' || p.endsWith('.db') ||
+      p.endsWith('.db-wal') || p.endsWith('.db-shm')) {
+    return res.status(404).send('Not found');
+  }
+  next();
+});
 app.use(express.static(path.join(__dirname)));
 
 // ---- Start Server ----

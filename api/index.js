@@ -5,8 +5,31 @@ const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 
 // ---- Auth Setup ----
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'PeakNuts2026!';
+// Admin credentials must be supplied through environment variables. There are
+// deliberately no hardcoded fallbacks so a missing configuration fails closed
+// instead of exposing a default account.
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+
+// ---- Helpers ----
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function isValidEmail(value) {
+  return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function cleanStr(value, max) {
+  if (typeof value !== 'string') return '';
+  var v = value.trim();
+  return v.length > max ? v.slice(0, max) : v;
+}
 
 // ---- Password Hashing ----
 function hashPassword(password, existingSalt) {
@@ -38,7 +61,7 @@ function sendOrderConfirmationEmail(toEmail, order) {
     var item = order.items[i];
     var lineTotal = item.qty * item.price;
     total += lineTotal;
-    itemsHtml += '<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:14px">' + item.name + '</td>' +
+    itemsHtml += '<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:14px">' + escapeHtml(item.name) + '</td>' +
       '<td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:14px;text-align:center">' + item.qty + '</td>' +
       '<td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:14px;text-align:right">Rs.' + lineTotal.toFixed(2) + '</td></tr>';
   }
@@ -49,12 +72,12 @@ function sendOrderConfirmationEmail(toEmail, order) {
     subject: 'Order Confirmed - ' + order.orderId + ' | Peak Nuts',
     html: '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:30px;background:#f9f8f5;border-radius:8px">' +
       '<h1 style="font-family:Georgia,serif;color:#1a1a1a;font-size:28px;margin-bottom:10px">Order Confirmed!</h1>' +
-      '<p style="color:#5d5b5b;font-size:15px;line-height:1.8">Thank you, <strong>' + order.customer + '</strong>! Your order has been placed successfully.</p>' +
+      '<p style="color:#5d5b5b;font-size:15px;line-height:1.8">Thank you, <strong>' + escapeHtml(order.customer) + '</strong>! Your order has been placed successfully.</p>' +
       '<div style="background:#fff;padding:20px;border-radius:6px;margin:20px 0">' +
         '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Order ID:</strong> ' + order.orderId + '</p>' +
         '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Payment:</strong> Cash on Delivery</p>' +
-        '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Phone:</strong> ' + order.phone + '</p>' +
-        '<p style="margin:0;font-size:14px;color:#5d5b5b"><strong>Delivery:</strong> ' + order.address + ', ' + order.city + '</p>' +
+        '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Phone:</strong> ' + escapeHtml(order.phone) + '</p>' +
+        '<p style="margin:0;font-size:14px;color:#5d5b5b"><strong>Delivery:</strong> ' + escapeHtml(order.address) + ', ' + escapeHtml(order.city) + '</p>' +
       '</div>' +
       '<table style="width:100%;border-collapse:collapse;margin:20px 0">' +
         '<thead><tr style="background:#1a1a1a;color:#fff">' +
@@ -151,7 +174,7 @@ function sendOrderStatusEmail(toEmail, order, newStatus) {
       '<div style="background:#fff;padding:20px;border-radius:6px;margin:20px 0">' +
         '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Order ID:</strong> ' + order.orderId + '</p>' +
         '<p style="margin:0 0 5px;font-size:14px;color:#5d5b5b"><strong>Status:</strong> ' + newStatus + '</p>' +
-        '<p style="margin:0;font-size:14px;color:#5d5b5b"><strong>Delivery:</strong> ' + (order.address || '') + ', ' + (order.city || '') + '</p>' +
+        '<p style="margin:0;font-size:14px;color:#5d5b5b"><strong>Delivery:</strong> ' + escapeHtml(order.address || '') + ', ' + escapeHtml(order.city || '') + '</p>' +
       '</div>' +
       '<p style="color:#5d5b5b;font-size:15px;line-height:1.8">Thank you for shopping with Peak Nuts!</p>' +
       '<p style="color:#8B9A46;font-weight:600;font-size:16px;margin-top:20px">&mdash; The Peak Nuts Team</p>' +
@@ -201,11 +224,21 @@ const authLimiter = rateLimit({
   message: { error: 'Too many attempts, please try again after 15 minutes' }
 });
 
+// Generous limiter for public write endpoints (checkout, newsletter, reviews)
+const publicWriteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' }
+});
+
 app.use('/api/login', authLimiter);
 app.use('/api/register', authLimiter);
 app.use('/api/user/login', authLimiter);
 app.use('/api/forgot-password', authLimiter);
 app.use('/api/verify-reset-code', authLimiter);
+app.use('/api/resend-verification', authLimiter);
 
 // ---- Mongoose Schemas ----
 const productSchema = new mongoose.Schema({
@@ -416,20 +449,6 @@ async function connectDB() {
   isConnected = true;
 }
 
-// Debug endpoint to check connection
-app.get('/api/debug', async (req, res) => {
-  try {
-    const uri = process.env.MONGO_URI;
-    const masked = uri ? uri.replace(/:([^@]+)@/, ':****@') : 'NOT SET';
-    await connectDB();
-    res.json({ status: 'connected', uri: masked });
-  } catch (err) {
-    const uri = process.env.MONGO_URI;
-    const masked = uri ? uri.replace(/:([^@]+)@/, ':****@') : 'NOT SET';
-    res.status(500).json({ status: 'failed', error: err.message, uri: masked });
-  }
-});
-
 // ---- Auth Endpoints ----
 app.post('/api/login', async (req, res) => {
   try {
@@ -437,6 +456,9 @@ app.post('/api/login', async (req, res) => {
     var { username, password } = req.body;
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required' });
+    }
+    if (!ADMIN_USERNAME || !ADMIN_PASSWORD) {
+      return res.status(500).json({ error: 'Admin credentials are not configured on the server' });
     }
     if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
       return res.status(401).json({ error: 'Invalid username or password' });
@@ -565,7 +587,7 @@ app.delete('/api/products/:id', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/orders', async (req, res) => {
+app.get('/api/orders', requireAuth, async (req, res) => {
   try {
     await connectDB();
     res.json(await Order.find().sort({ date: -1 }));
@@ -574,12 +596,50 @@ app.get('/api/orders', async (req, res) => {
   }
 });
 
-app.post('/api/orders', async (req, res) => {
+app.post('/api/orders', publicWriteLimiter, async (req, res) => {
   try {
     await connectDB();
-    const { customer, email, phone, city, address, items } = req.body;
-    if (!customer || !email || !phone || !city || !address || !items || !items.length) {
+    const customer = cleanStr(req.body.customer, 120);
+    const email = cleanStr(req.body.email, 200).toLowerCase();
+    const phone = cleanStr(req.body.phone, 40);
+    const city = cleanStr(req.body.city, 80);
+    const address = cleanStr(req.body.address, 300);
+    const rawItems = req.body.items;
+
+    if (!customer || !email || !phone || !city || !address) {
       return res.status(400).json({ error: 'All fields are required' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'A valid email address is required' });
+    }
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+      return res.status(400).json({ error: 'Your order must contain at least one item' });
+    }
+    if (rawItems.length > 50) {
+      return res.status(400).json({ error: 'Too many items in the order' });
+    }
+
+    // Never trust client-supplied prices: resolve every item against the catalog.
+    const names = [];
+    for (var i = 0; i < rawItems.length; i++) {
+      var n = cleanStr(rawItems[i] && rawItems[i].name, 200);
+      if (n) names.push(n);
+    }
+    const catalog = await Product.find({ name: { $in: names } });
+    const priceMap = {};
+    for (var c = 0; c < catalog.length; c++) priceMap[catalog[c].name] = catalog[c].price;
+
+    const sanitizedItems = [];
+    for (var j = 0; j < rawItems.length; j++) {
+      var item = rawItems[j] || {};
+      var itemName = cleanStr(item.name, 200);
+      if (!itemName || priceMap[itemName] === undefined) {
+        return res.status(400).json({ error: 'Unknown product: ' + (itemName || '(missing name)') });
+      }
+      var qty = parseInt(item.qty, 10);
+      if (!Number.isFinite(qty) || qty < 1) qty = 1;
+      if (qty > 100) qty = 100;
+      sanitizedItems.push({ name: itemName, qty: qty, price: priceMap[itemName] });
     }
 
     // Generate orderId: find max existing PN-XXXX and increment
@@ -593,7 +653,7 @@ app.post('/api/orders', async (req, res) => {
     const date = new Date().toISOString().slice(0, 10);
     const status = 'Pending';
 
-    const order = await Order.create({ orderId, customer, email, phone, city, address, status, date, items });
+    const order = await Order.create({ orderId, customer, email, phone, city, address, status, date, items: sanitizedItems });
     await sendOrderConfirmationEmail(email, order);
 
     res.status(201).json(order);
@@ -605,12 +665,18 @@ app.post('/api/orders', async (req, res) => {
 app.put('/api/orders/:id', requireAuth, async (req, res) => {
   try {
     await connectDB();
+    const allowedStatuses = ['Pending', 'Shipped', 'Delivered'];
+    const status = req.body.status;
+    if (allowedStatuses.indexOf(status) === -1) {
+      return res.status(400).json({ error: 'Invalid order status' });
+    }
     const oldOrder = await Order.findById(req.params.id);
     if (!oldOrder) return res.status(404).json({ error: 'Order not found' });
-    const order = await Order.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    // Only the status may be changed through this endpoint.
+    const order = await Order.findByIdAndUpdate(req.params.id, { status: status }, { new: true });
     // Send status notification email
-    if (req.body.status && order.email && (req.body.status === 'Shipped' || req.body.status === 'Delivered')) {
-      sendOrderStatusEmail(order.email, order, req.body.status);
+    if (order.email && (status === 'Shipped' || status === 'Delivered')) {
+      sendOrderStatusEmail(order.email, order, status);
     }
     res.json(order);
   } catch (err) {
@@ -638,11 +704,11 @@ app.delete('/api/subscribers/:id', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/subscribers', async (req, res) => {
+app.post('/api/subscribers', publicWriteLimiter, async (req, res) => {
   try {
     await connectDB();
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email is required' });
+    const email = cleanStr(req.body.email, 200).toLowerCase();
+    if (!email || !isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required' });
     const existing = await Subscriber.findOne({ email });
     if (existing) return res.status(409).json({ error: 'Already subscribed' });
     const date = new Date().toISOString().slice(0, 10);
@@ -675,20 +741,25 @@ app.post('/api/register', async (req, res) => {
   try {
     await connectDB();
     var { name, email, password } = req.body;
+    name = cleanStr(name, 120);
+    email = cleanStr(email, 200).toLowerCase();
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required' });
     }
-    if (password.length < 6) {
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'A valid email address is required' });
+    }
+    if (typeof password !== 'string' || password.length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
-    var existing = await User.findOne({ email: email.toLowerCase() });
+    var existing = await User.findOne({ email: email });
     if (existing) {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
     var hashed = hashPassword(password);
     var user = await User.create({
       name: name,
-      email: email.toLowerCase(),
+      email: email,
       password: hashed.hash,
       salt: hashed.salt,
       verified: false
@@ -715,10 +786,11 @@ app.post('/api/user/login', async (req, res) => {
   try {
     await connectDB();
     var { email, password } = req.body;
+    email = cleanStr(email, 200).toLowerCase();
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
-    var user = await User.findOne({ email: email.toLowerCase() });
+    var user = await User.findOne({ email: email });
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -785,14 +857,14 @@ app.get('/api/user/orders', requireUser, async (req, res) => {
 app.post('/api/forgot-password', async (req, res) => {
   try {
     await connectDB();
-    var { email } = req.body;
+    var email = cleanStr(req.body.email, 200).toLowerCase();
     if (!email) return res.status(400).json({ error: 'Email is required' });
-    var user = await User.findOne({ email: email.toLowerCase() });
+    var user = await User.findOne({ email: email });
     // Always return success to prevent email enumeration
     if (!user) return res.json({ message: 'If an account exists, a reset code has been sent.' });
     // Delete old reset tokens for this user
     await PasswordResetToken.deleteMany({ userId: user._id });
-    var code = Math.floor(Math.random() * 1000000).toString().padStart(6, '0');
+    var code = crypto.randomInt(0, 1000000).toString().padStart(6, '0');
     await PasswordResetToken.create({ code: code, userId: user._id });
     await sendPasswordResetEmail(user.email, code);
     res.json({ message: 'If an account exists, a reset code has been sent.' });
@@ -805,9 +877,10 @@ app.post('/api/forgot-password', async (req, res) => {
 app.post('/api/verify-reset-code', async (req, res) => {
   try {
     await connectDB();
-    var { email, code } = req.body;
+    var email = cleanStr(req.body.email, 200).toLowerCase();
+    var code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
     if (!email || !code) return res.status(400).json({ error: 'Email and code are required' });
-    var user = await User.findOne({ email: email.toLowerCase() });
+    var user = await User.findOne({ email: email });
     if (!user) return res.status(400).json({ error: 'Invalid code or email.' });
     var resetEntry = await PasswordResetToken.findOne({ userId: user._id });
     if (!resetEntry) return res.status(400).json({ error: 'No reset code found. Please request a new one.' });
@@ -1010,20 +1083,21 @@ app.get('/api/reviews/:productId', async (req, res) => {
   }
 });
 
-app.post('/api/reviews/:productId', requireUser, async (req, res) => {
+app.post('/api/reviews/:productId', publicWriteLimiter, requireUser, async (req, res) => {
   try {
     await connectDB();
-    var { rating, comment } = req.body;
-    if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+    var rating = parseInt(req.body.rating, 10);
+    var comment = cleanStr(req.body.comment, 1000);
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be between 1 and 5' });
     var existing = await Review.findOne({ userId: req.user._id, productId: req.params.productId });
     if (existing) {
       existing.rating = rating;
-      existing.comment = comment || '';
+      existing.comment = comment;
       existing.createdAt = new Date();
       await existing.save();
       res.json({ message: 'Review updated' });
     } else {
-      await Review.create({ productId: req.params.productId, userId: req.user._id, rating: rating, comment: comment || '' });
+      await Review.create({ productId: req.params.productId, userId: req.user._id, rating: rating, comment: comment });
       res.status(201).json({ message: 'Review added' });
     }
   } catch (err) {
