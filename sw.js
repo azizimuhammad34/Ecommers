@@ -1,11 +1,10 @@
-var CACHE_NAME = 'peaknuts-v1';
+var CACHE_NAME = 'peaknuts-v2';
 var STATIC_ASSETS = [
   '/',
-  '/index.html',
-  '/shop.html',
-  '/account.html',
-  '/about.html',
-  '/contact.html',
+  '/shop',
+  '/account',
+  '/about',
+  '/contact',
   '/styles.css',
   '/script.js',
   '/account.js',

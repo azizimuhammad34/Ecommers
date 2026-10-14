@@ -1,5 +1,5 @@
 # Keep server-side and developer-only files out of the public deployment.
-server.js
+scripts
 *.db
 *.db-wal
 *.db-shm

@@ -1,3 +1,7 @@
+// Load .env for local development. In production (Vercel) the variables are
+// already present and dotenv is a harmless no-op.
+try { require('dotenv').config({ quiet: true }); } catch (e) { /* optional dependency */ }
+
 const express = require('express');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
@@ -31,18 +35,61 @@ function cleanStr(value, max) {
   return v.length > max ? v.slice(0, max) : v;
 }
 
-// ---- Password Hashing ----
-function hashPassword(password, existingSalt) {
-  var salt = existingSalt || crypto.randomBytes(16).toString('hex');
-  var hash = crypto.scryptSync(password, salt, 64).toString('hex');
-  return { hash: hash, salt: salt };
+// Log the real error server-side but never leak internals to the client.
+function serverError(res, err) {
+  console.error(err);
+  if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
 }
 
-function verifyPassword(password, hash, salt) {
-  var derived = crypto.scryptSync(password, salt, 64);
+// Constant-time string comparison for secrets such as reset codes.
+function safeEqual(a, b) {
+  var ba = Buffer.from(String(a));
+  var bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+// ---- Password Hashing ----
+function scryptAsync(password, salt, len) {
+  return new Promise(function (resolve, reject) {
+    crypto.scrypt(password, salt, len, function (err, derivedKey) {
+      if (err) reject(err); else resolve(derivedKey);
+    });
+  });
+}
+
+async function hashPassword(password, existingSalt) {
+  var salt = existingSalt || crypto.randomBytes(16).toString('hex');
+  var hash = await scryptAsync(password, salt, 64);
+  return { hash: hash.toString('hex'), salt: salt };
+}
+
+async function verifyPassword(password, hash, salt) {
+  var derived = await scryptAsync(password, salt, 64);
   var hashBuffer = Buffer.from(hash, 'hex');
   if (derived.length !== hashBuffer.length) return false;
   return crypto.timingSafeEqual(derived, hashBuffer);
+}
+
+// Whitelist and coerce product fields so arbitrary keys can never be persisted.
+function sanitizeProduct(body) {
+  body = body || {};
+  var price = Number(body.price);
+  var oldPrice = Number(body.oldPrice);
+  var rating = Number(body.rating);
+  return {
+    name:        cleanStr(body.name, 200),
+    category:    cleanStr(body.category, 120),
+    price:       Number.isFinite(price) && price >= 0 ? price : 0,
+    stock:       cleanStr(body.stock, 60) || 'In Stock',
+    image:       cleanStr(body.image, 1000),
+    section:     cleanStr(body.section, 60),
+    badge:       cleanStr(body.badge, 30),
+    oldPrice:    Number.isFinite(oldPrice) && oldPrice >= 0 ? oldPrice : 0,
+    rating:      Number.isFinite(rating) && rating >= 1 && rating <= 5 ? rating : 5,
+    description: cleanStr(body.description, 2000),
+    urduName:    cleanStr(body.urduName, 200)
+  };
 }
 
 // ---- Email Transporter ----
@@ -130,7 +177,7 @@ function sendPasswordResetEmail(toEmail, code) {
 }
 
 function sendVerificationEmail(toEmail, verifyToken) {
-  var verifyLink = (process.env.SITE_URL || 'https://peak-nuts.vercel.app') + '/account.html?verify=' + verifyToken;
+  var verifyLink = (process.env.SITE_URL || 'https://ecommers-teal-phi.vercel.app') + '/account?verify=' + verifyToken;
   const mailOptions = {
     from: '"Peak Nuts" <' + process.env.EMAIL_USER + '>',
     to: toEmail,
@@ -213,7 +260,17 @@ function sendWelcomeEmail(toEmail) {
 }
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.disable('x-powered-by');
+// Trust the single Vercel proxy hop so express-rate-limit and req.ip are correct.
+app.set('trust proxy', 1);
+app.use(function (req, res, next) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+app.use(express.json({ limit: '1mb' }));
 
 // ---- Rate Limiting for Auth Endpoints ----
 const authLimiter = rateLimit({
@@ -265,10 +322,18 @@ const orderSchema = new mongoose.Schema({
   status:   { type: String, required: true },
   date:     { type: String, required: true },
   items: [{
+    productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
     name:  String,
     qty:   Number,
     price: Number
   }]
+});
+orderSchema.index({ email: 1 });
+
+// Monotonic counter used to generate collision-free order IDs.
+const counterSchema = new mongoose.Schema({
+  _id: { type: String },
+  seq: { type: Number, default: 0 }
 });
 
 const subscriberSchema = new mongoose.Schema({
@@ -291,6 +356,7 @@ const Order      = mongoose.models.Order      || mongoose.model('Order', orderSc
 const Subscriber = mongoose.models.Subscriber || mongoose.model('Subscriber', subscriberSchema);
 const Revenue    = mongoose.models.Revenue    || mongoose.model('Revenue', revenueSchema);
 const Token      = mongoose.models.Token      || mongoose.model('Token', tokenSchema);
+const Counter    = mongoose.models.Counter    || mongoose.model('Counter', counterSchema);
 
 const userSchema = new mongoose.Schema({
   name:      { type: String, required: true },
@@ -362,7 +428,7 @@ async function requireAuth(req, res, next) {
     }
     next();
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return serverError(res, err);
   }
 }
 
@@ -386,7 +452,7 @@ async function requireUser(req, res, next) {
     req.user = user;
     next();
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return serverError(res, err);
   }
 }
 
@@ -438,15 +504,33 @@ const seedRevenue = {
 };
 
 // ---- MongoDB Connection (cached for serverless) ----
-let isConnected = false;
-
 async function connectDB() {
-  if (isConnected) return;
+  if (mongoose.connection.readyState === 1) return;
   if (!process.env.MONGO_URI) throw new Error('MONGO_URI env variable is not set');
   await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 });
   // Drop stale indexes from old schema (e.g. token_1 on passwordresettokens)
   await PasswordResetToken.syncIndexes().catch(function () {});
-  isConnected = true;
+}
+
+// Atomically allocate the next order number. The counter is seeded once from the
+// highest existing order so it stays monotonic even on an existing database.
+async function nextOrderNumber() {
+  var counter = await Counter.findById('orderSeq');
+  if (!counter) {
+    var max = 1010;
+    var existing = await Order.find({}, 'orderId').lean();
+    for (var i = 0; i < existing.length; i++) {
+      var m = /(\d+)/.exec(existing[i].orderId || '');
+      if (m) { var n = parseInt(m[1], 10); if (n > max) max = n; }
+    }
+    try {
+      counter = await Counter.create({ _id: 'orderSeq', seq: max });
+    } catch (e) {
+      counter = await Counter.findById('orderSeq'); // lost a create race
+    }
+  }
+  var updated = await Counter.findByIdAndUpdate('orderSeq', { $inc: { seq: 1 } }, { new: true });
+  return updated.seq;
 }
 
 // ---- Auth Endpoints ----
@@ -467,7 +551,7 @@ app.post('/api/login', async (req, res) => {
     await Token.create({ token: token });
     res.json({ token: token });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -478,7 +562,7 @@ app.post('/api/logout', requireAuth, async (req, res) => {
     await Token.deleteOne({ token: token });
     res.json({ message: 'Logged out successfully' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -526,7 +610,7 @@ app.post('/api/seed', requireAuth, async (req, res) => {
 
     res.json({ message: 'Seed complete' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -551,28 +635,36 @@ app.get('/api/products', async (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
 app.post('/api/products', requireAuth, async (req, res) => {
   try {
     await connectDB();
-    const product = await Product.create(req.body);
+    const data = sanitizeProduct(req.body);
+    if (!data.name || !data.category) {
+      return res.status(400).json({ error: 'Name and category are required' });
+    }
+    const product = await Product.create(data);
     res.status(201).json(product);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
 app.put('/api/products/:id', requireAuth, async (req, res) => {
   try {
     await connectDB();
-    const product = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const data = sanitizeProduct(req.body);
+    if (!data.name || !data.category) {
+      return res.status(400).json({ error: 'Name and category are required' });
+    }
+    const product = await Product.findByIdAndUpdate(req.params.id, data, { new: true, runValidators: true });
     if (!product) return res.status(404).json({ error: 'Product not found' });
     res.json(product);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -583,7 +675,7 @@ app.delete('/api/products/:id', requireAuth, async (req, res) => {
     if (!product) return res.status(404).json({ error: 'Product not found' });
     res.json({ message: 'Deleted' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -592,7 +684,7 @@ app.get('/api/orders', requireAuth, async (req, res) => {
     await connectDB();
     res.json(await Order.find().sort({ date: -1 }));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -620,45 +712,51 @@ app.post('/api/orders', publicWriteLimiter, async (req, res) => {
     }
 
     // Never trust client-supplied prices: resolve every item against the catalog.
+    // Prefer the stable product id, fall back to the (unique) product name.
+    const ids = [];
     const names = [];
     for (var i = 0; i < rawItems.length; i++) {
-      var n = cleanStr(rawItems[i] && rawItems[i].name, 200);
-      if (n) names.push(n);
+      var raw = rawItems[i] || {};
+      if (raw.productId && mongoose.isValidObjectId(raw.productId)) {
+        ids.push(raw.productId);
+      } else {
+        var n = cleanStr(raw.name, 200);
+        if (n) names.push(n);
+      }
     }
-    const catalog = await Product.find({ name: { $in: names } });
-    const priceMap = {};
-    for (var c = 0; c < catalog.length; c++) priceMap[catalog[c].name] = catalog[c].price;
+    const catalogById = ids.length ? await Product.find({ _id: { $in: ids } }) : [];
+    const catalogByName = names.length ? await Product.find({ name: { $in: names } }) : [];
+    const byId = {};
+    for (var a = 0; a < catalogById.length; a++) byId[catalogById[a]._id.toString()] = catalogById[a];
+    const byName = {};
+    for (var b = 0; b < catalogByName.length; b++) byName[catalogByName[b].name] = catalogByName[b];
 
     const sanitizedItems = [];
     for (var j = 0; j < rawItems.length; j++) {
       var item = rawItems[j] || {};
-      var itemName = cleanStr(item.name, 200);
-      if (!itemName || priceMap[itemName] === undefined) {
-        return res.status(400).json({ error: 'Unknown product: ' + (itemName || '(missing name)') });
+      var product = item.productId && mongoose.isValidObjectId(item.productId)
+        ? byId[item.productId.toString()]
+        : byName[cleanStr(item.name, 200)];
+      if (!product) {
+        return res.status(400).json({ error: 'Unknown product: ' + (cleanStr(item.name, 200) || '(missing)') });
       }
       var qty = parseInt(item.qty, 10);
       if (!Number.isFinite(qty) || qty < 1) qty = 1;
       if (qty > 100) qty = 100;
-      sanitizedItems.push({ name: itemName, qty: qty, price: priceMap[itemName] });
+      sanitizedItems.push({ productId: product._id, name: product.name, qty: qty, price: product.price });
     }
 
-    // Generate orderId: find max existing PN-XXXX and increment
-    const lastOrder = await Order.findOne().sort({ _id: -1 }).limit(1);
-    let nextNum = 1011;
-    if (lastOrder && lastOrder.orderId) {
-      const match = lastOrder.orderId.match(/PN-(\d+)/);
-      if (match) nextNum = parseInt(match[1]) + 1;
-    }
-    const orderId = 'PN-' + nextNum;
+    const orderId = 'PN-' + (await nextOrderNumber());
     const date = new Date().toISOString().slice(0, 10);
     const status = 'Pending';
 
     const order = await Order.create({ orderId, customer, email, phone, city, address, status, date, items: sanitizedItems });
-    await sendOrderConfirmationEmail(email, order);
+    // Fire-and-forget: never let SMTP latency/failure block or fail checkout.
+    sendOrderConfirmationEmail(email, order);
 
     res.status(201).json(order);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -680,7 +778,7 @@ app.put('/api/orders/:id', requireAuth, async (req, res) => {
     }
     res.json(order);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -689,7 +787,7 @@ app.get('/api/subscribers', requireAuth, async (req, res) => {
     await connectDB();
     res.json(await Subscriber.find());
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -700,7 +798,7 @@ app.delete('/api/subscribers/:id', requireAuth, async (req, res) => {
     if (!sub) return res.status(404).json({ error: 'Subscriber not found' });
     res.json({ message: 'Deleted' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -713,15 +811,10 @@ app.post('/api/subscribers', publicWriteLimiter, async (req, res) => {
     if (existing) return res.status(409).json({ error: 'Already subscribed' });
     const date = new Date().toISOString().slice(0, 10);
     await Subscriber.create({ email, date });
-    var emailStatus = 'sent';
-    try {
-      await sendWelcomeEmail(email);
-    } catch (emailErr) {
-      emailStatus = 'failed: ' + emailErr.message;
-    }
-    res.status(201).json({ message: 'Subscribed successfully', email_status: emailStatus });
+    sendWelcomeEmail(email);
+    res.status(201).json({ message: 'Subscribed successfully' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -731,7 +824,7 @@ app.get('/api/revenue', requireAuth, async (req, res) => {
     const revenue = await Revenue.findOne();
     res.json(revenue || { labels: [], values: [] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -756,7 +849,7 @@ app.post('/api/register', async (req, res) => {
     if (existing) {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
-    var hashed = hashPassword(password);
+    var hashed = await hashPassword(password);
     var user = await User.create({
       name: name,
       email: email,
@@ -765,20 +858,20 @@ app.post('/api/register', async (req, res) => {
       verified: false
     });
 
-    // Send verification email
+    // Send verification email (fire-and-forget)
     var verifyToken = crypto.randomBytes(32).toString('hex');
     await EmailVerificationToken.create({ token: verifyToken, userId: user._id });
-    await sendVerificationEmail(user.email, verifyToken);
+    sendVerificationEmail(user.email, verifyToken);
 
     var token = crypto.randomBytes(32).toString('hex');
     await UserToken.create({ token: token, userId: user._id });
     res.status(201).json({
       token: token,
-      profile: { name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address },
+      profile: { name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address, verified: user.verified },
       needsVerification: true
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -794,17 +887,17 @@ app.post('/api/user/login', async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
-    if (!verifyPassword(password, user.password, user.salt)) {
+    if (!(await verifyPassword(password, user.password, user.salt))) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     var token = crypto.randomBytes(32).toString('hex');
     await UserToken.create({ token: token, userId: user._id });
     res.json({
       token: token,
-      profile: { name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address }
+      profile: { name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address, verified: user.verified }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -815,16 +908,16 @@ app.post('/api/user/logout', requireUser, async (req, res) => {
     await UserToken.deleteOne({ token: token });
     res.json({ message: 'Logged out successfully' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
 app.get('/api/user/profile', requireUser, async (req, res) => {
   try {
     var user = req.user;
-    res.json({ name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address });
+    res.json({ name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address, verified: user.verified });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -832,14 +925,14 @@ app.put('/api/user/profile', requireUser, async (req, res) => {
   try {
     var { name, phone, city, address } = req.body;
     var user = req.user;
-    if (name !== undefined) user.name = name;
-    if (phone !== undefined) user.phone = phone;
-    if (city !== undefined) user.city = city;
-    if (address !== undefined) user.address = address;
+    if (name !== undefined) user.name = cleanStr(name, 120);
+    if (phone !== undefined) user.phone = cleanStr(phone, 40);
+    if (city !== undefined) user.city = cleanStr(city, 80);
+    if (address !== undefined) user.address = cleanStr(address, 300);
     await user.save();
-    res.json({ name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address });
+    res.json({ name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address, verified: user.verified });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -849,7 +942,7 @@ app.get('/api/user/orders', requireUser, async (req, res) => {
     var userOrders = await Order.find({ email: req.user.email }).sort({ date: -1 });
     res.json(userOrders);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -866,10 +959,10 @@ app.post('/api/forgot-password', async (req, res) => {
     await PasswordResetToken.deleteMany({ userId: user._id });
     var code = crypto.randomInt(0, 1000000).toString().padStart(6, '0');
     await PasswordResetToken.create({ code: code, userId: user._id });
-    await sendPasswordResetEmail(user.email, code);
+    sendPasswordResetEmail(user.email, code);
     res.json({ message: 'If an account exists, a reset code has been sent.' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -894,8 +987,8 @@ app.post('/api/verify-reset-code', async (req, res) => {
       await PasswordResetToken.deleteMany({ userId: user._id });
       return res.status(400).json({ error: 'Too many failed attempts. Please request a new code.' });
     }
-    // Verify code
-    if (resetEntry.code !== code) {
+    // Verify code (constant-time)
+    if (!safeEqual(resetEntry.code, code)) {
       resetEntry.attempts += 1;
       await resetEntry.save();
       var remaining = 3 - resetEntry.attempts;
@@ -911,7 +1004,7 @@ app.post('/api/verify-reset-code', async (req, res) => {
     await resetEntry.save();
     res.json({ message: 'Code verified.', grantToken: grantToken });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -929,7 +1022,7 @@ app.post('/api/reset-password', async (req, res) => {
       await PasswordResetToken.deleteMany({ userId: resetEntry.userId });
       return res.status(400).json({ error: 'Reset session has expired. Please request a new code.' });
     }
-    var hashed = hashPassword(password);
+    var hashed = await hashPassword(password);
     await User.findByIdAndUpdate(resetEntry.userId, { password: hashed.hash, salt: hashed.salt });
     await PasswordResetToken.deleteMany({ userId: resetEntry.userId });
     // Auto-login: create session token and return profile
@@ -939,18 +1032,18 @@ app.post('/api/reset-password', async (req, res) => {
     res.json({
       message: 'Password reset successfully!',
       token: sessionToken,
-      profile: { name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address }
+      profile: { name: user.name, email: user.email, phone: user.phone, city: user.city, address: user.address, verified: user.verified }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
 // ---- Email Verification ----
-app.get('/api/verify-email', async (req, res) => {
+app.post('/api/verify-email', async (req, res) => {
   try {
     await connectDB();
-    var token = req.query.token;
+    var token = cleanStr((req.body && req.body.token) || req.query.token, 200);
     if (!token) return res.status(400).json({ error: 'Token is required' });
     var verifyToken = await EmailVerificationToken.findOne({ token: token });
     if (!verifyToken) return res.status(400).json({ error: 'Invalid or expired verification link' });
@@ -963,7 +1056,7 @@ app.get('/api/verify-email', async (req, res) => {
     await EmailVerificationToken.deleteMany({ userId: verifyToken.userId });
     res.json({ message: 'Email verified successfully!' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -975,10 +1068,10 @@ app.post('/api/resend-verification', requireUser, async (req, res) => {
     await EmailVerificationToken.deleteMany({ userId: user._id });
     var token = crypto.randomBytes(32).toString('hex');
     await EmailVerificationToken.create({ token: token, userId: user._id });
-    await sendVerificationEmail(user.email, token);
+    sendVerificationEmail(user.email, token);
     res.json({ message: 'Verification email sent' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1012,7 +1105,7 @@ app.get('/api/user/wishlist', requireUser, async (req, res) => {
     }
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1026,7 +1119,7 @@ app.post('/api/user/wishlist', requireUser, async (req, res) => {
     await Wishlist.create({ userId: req.user._id, productId: productId });
     res.status(201).json({ message: 'Added to wishlist' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1037,7 +1130,7 @@ app.delete('/api/user/wishlist/:productId', requireUser, async (req, res) => {
     if (result.deletedCount === 0) return res.status(404).json({ error: 'Not in wishlist' });
     res.json({ message: 'Removed from wishlist' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1079,7 +1172,7 @@ app.get('/api/reviews/:productId', async (req, res) => {
     var avgRating = reviews.length > 0 ? Math.round((totalRating / reviews.length) * 10) / 10 : null;
     res.json({ reviews: result, avgRating: avgRating, count: reviews.length, userReview: userReview });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1101,7 +1194,7 @@ app.post('/api/reviews/:productId', publicWriteLimiter, requireUser, async (req,
       res.status(201).json({ message: 'Review added' });
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1131,7 +1224,7 @@ app.get('/api/admin/reviews', requireAuth, async (req, res) => {
     });
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1142,7 +1235,7 @@ app.delete('/api/admin/reviews/:id', requireAuth, async (req, res) => {
     if (!review) return res.status(404).json({ error: 'Review not found' });
     res.json({ message: 'Review deleted' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1151,11 +1244,12 @@ app.get('/api/admin/users', requireAuth, async (req, res) => {
   try {
     await connectDB();
     var users = await User.find({}, 'name email phone city address verified createdAt').sort({ createdAt: -1 });
-    var result = [];
-    for (var i = 0; i < users.length; i++) {
-      var u = users[i];
-      var orderCount = await Order.countDocuments({ email: u.email });
-      result.push({
+    // Single grouped query instead of one count per user (avoids N+1).
+    var counts = await Order.aggregate([{ $group: { _id: '$email', count: { $sum: 1 } } }]);
+    var countMap = {};
+    for (var c = 0; c < counts.length; c++) countMap[counts[c]._id] = counts[c].count;
+    var result = users.map(function (u) {
+      return {
         _id: u._id,
         name: u.name,
         email: u.email,
@@ -1164,12 +1258,12 @@ app.get('/api/admin/users', requireAuth, async (req, res) => {
         address: u.address,
         verified: u.verified,
         createdAt: u.createdAt,
-        orderCount: orderCount
-      });
-    }
+        orderCount: countMap[u.email] || 0
+      };
+    });
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
@@ -1235,8 +1329,17 @@ app.get('/api/admin/analytics', requireAuth, async (req, res) => {
       topProducts: topList
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(res, err);
   }
 });
 
 module.exports = app;
+
+// Local development: run `node api/index.js` (or `npm start`) to serve the same
+// app on a port. On Vercel the module is imported, so this block never runs.
+if (require.main === module) {
+  var PORT = process.env.PORT || 5000;
+  app.listen(PORT, function () {
+    console.log('Peak Nuts API listening on http://localhost:' + PORT);
+  });
+}

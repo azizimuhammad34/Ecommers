@@ -406,7 +406,11 @@
     var urlParams = new URLSearchParams(window.location.search);
     var verifyToken = urlParams.get('verify');
     if (verifyToken) {
-      fetch(API_BASE + '/verify-email?token=' + verifyToken)
+      fetch(API_BASE + '/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: verifyToken })
+      })
         .then(function (res) { return res.json().then(function (data) { return { status: res.status, data: data }; }); })
         .then(function (result) {
           if (result.status === 200) {

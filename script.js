@@ -1335,6 +1335,8 @@
     orderForm.addEventListener('submit', function (e) {
       e.preventDefault();
       var submitBtn = document.getElementById('orderSubmitBtn');
+      var orderError = document.getElementById('orderError');
+      if (orderError) orderError.style.display = 'none';
       submitBtn.disabled = true;
       submitBtn.textContent = 'SUBMITTING...';
 
@@ -1349,7 +1351,7 @@
         phone: document.getElementById('orderPhone').value.trim(),
         city: document.getElementById('orderCity').value.trim(),
         address: addr + (postcode ? ', ' + postcode : ''),
-        items: [{ name: currentOrderProduct.name, qty: 1, price: currentOrderProduct.price }]
+        items: [{ productId: currentOrderProduct._id, name: currentOrderProduct.name, qty: 1, price: currentOrderProduct.price }]
       };
 
       fetch(API_BASE + '/orders', {
@@ -1358,21 +1360,26 @@
         body: JSON.stringify(orderData)
       })
         .then(function (res) {
-          if (!res.ok) throw new Error('Order failed');
-          return res.json();
+          return res.json().catch(function () { return {}; }).then(function (data) {
+            return { ok: res.ok, status: res.status, data: data };
+          });
         })
-        .then(function () {
-          orderForm.style.display = 'none';
-          orderSuccess.style.display = '';
+        .then(function (result) {
           submitBtn.disabled = false;
           submitBtn.textContent = 'SUBMIT ORDER';
+          if (result.ok) {
+            orderForm.style.display = 'none';
+            orderSuccess.style.display = '';
+            return;
+          }
+          var msg = (result.data && result.data.error) || 'Could not place your order. Please try again.';
+          if (result.status === 429) msg = 'Too many requests. Please wait a few minutes and try again.';
+          if (orderError) { orderError.textContent = msg; orderError.style.display = ''; }
         })
         .catch(function () {
-          // Even if API fails, show success (order data was captured)
-          orderForm.style.display = 'none';
-          orderSuccess.style.display = '';
           submitBtn.disabled = false;
           submitBtn.textContent = 'SUBMIT ORDER';
+          if (orderError) { orderError.textContent = 'Network error. Please check your connection and try again.'; orderError.style.display = ''; }
         });
     });
   }
